@@ -124,143 +124,69 @@ def jacobian(phi1: float, phi2: float, L1: float, L2: float):
 
 def controller(q: np.ndarray,
                qd: np.ndarray,
+               theta: np.ndarray,      # <-- ADDED: Current motor positions
+               theta_dot: np.ndarray,  # <-- Current motor velocities
                x_des: float,
                z_des: float,
                xd_des: float,
                zd_des: float,
-               xdd_des: float,
-               zdd_des: float,
-               dt: float,
-               theta_dot: float,
-               theta_ddot: float,
-               F_des: np.ndarray = None,
-               tip_force: np.ndarray = None):
+               dt: float):
     
-    # 1. Kinematics & Errors
-    J_cur = jacobian(q[0], q[1], L1, L2)
-    c_current = forward_kinematics(q[0], q[1])
-    c_des = np.array([x_des, z_des])
-    Ce = c_des - c_current
+    # ---------------------------------------------------------
+    # STEP A: Calculate required spring deflection 
+    # ---------------------------------------------------------
     
-    # joint space and velocity error
-    J_cur = jacobian(q[0], q[1], L1, L2)
-    qd_des = np.linalg.pinv(J_cur) @ np.array([xd_des, zd_des])
-    global q_des_prev
-    q_des = q_des_prev + qd_des * dt
-    q_des_prev = q_des.copy()
-    q_err = q_des - q
-    qd_err = qd_des - qd# 2. Gains (Adjust these to prevent the wall from moving too much)
-
-
-    # Task-space velocity error
-    c_dot = J_cur @ qd
-    c_dot_des = np.array([xd_des, zd_des])
-    c_dot_err = c_dot_des - c_dot
-
-    #task pace acceleration error
-    c_ddot_des = np.array([xdd_des,zdd_des])
+    # 1. Use Inverse Kinematics to find desired link position (q_des)
+    q_target = inverse_kinematics(x_des, z_des, elbow_up=False)
+    if q_target is None:
+        q_target = q.copy() # Fallback if out of reach
+    q_des = q_target
     
-    if not hasattr(controller, "c_dot_prev"):
-            controller.c_dot_prev = c_dot.copy()
-    c_ddot = (c_dot - controller.c_dot_prev) / dt
-    controller.c_dot_prev = c_dot.copy()
+    # 2. Calculate desired joint velocities (qd_des) using the Jacobian
+    J_des = jacobian(q_des[0], q_des[1], L1, L2)
+    try:
+        qd_des = np.linalg.pinv(J_des) @ np.array([xd_des, zd_des])
+    except:
+        qd_des = np.zeros(2)
 
-    # fliter
-    if not hasattr(controller, "c_ddot_filt_prev"):
-            controller.c_ddot_filt_prev = c_ddot.copy()
-    alpha_ddot = 0.5
-    c_ddot = alpha_ddot * controller.c_ddot_filt_prev + (1.0 - alpha_ddot) * c_ddot
-    controller.c_ddot_filt_prev = c_ddot.copy()
-
-    c_ddot_err = c_ddot_des - c_ddot
-
-    # 3. Gravity Cancellation for the links
-    m1, m2 = 1.5, 1.5 # From simulator_setup.py
+    # 3. Calculate gravity compensation (Torque required to hold links up)
+    m1, m2 = 1.5, 1.5
     g = 9.81
-    lc1, lc2 = L1/2, L2/2
-    r = 0.15
-    r_rotor = 0.08
-
-    # Motor inertias (solid sphere, used in J term)
-    Jm = np.array([2/5 * 0.5 * r_rotor**2,   # rotor1: 0.00128 kg·m²
-                2/5 * 0.4 * r_rotor**2])  # rotor2: 0.001024 kg·m²
-
-    # Motor damping (from RevoluteJoint damping parameter)
-    Dm = np.array([0.1, 0.1])    # N·m·s/rad
-
-    # Inertia matrix M(q)
-    I1 = 2/5*m1*r**2   
-    I2 = 2/5*m2*r**2  
-    M11 = I1 + I2 + m1*lc1**2 + m2*(L1**2 + lc2**2 + 2*L1*lc2*math.cos(q[1]))
-    M12 = I2 + m2*(lc2**2 + L1*lc2*math.cos(q[1]))
-    M21 = I2 + m2*(lc2**2 + L1*lc2*math.cos(q[1]))
-    M22 = I2 + m2*lc2**2
-    M = np.array([[M11, M12],
-                  [M21, M22]])
+    lc1, lc2 = L1 / 2, L2 / 2
     
-    # Coriolis matrix C(q, qdot)
-    C11 = -m2 * L1 * lc2 * math.sin(q[1]) * qd[1]
-    C12 = -m2 * L1 * lc2 * math.sin(q[1]) * (qd[0] + qd[1])
-    C21 =  m2 * L1 * lc2 * math.sin(q[1]) * qd[0]
-    C22 = 0.0
-    C = np.array([[C11, C12],
-                [C21, C22]])
+    # Positive torque required to counteract the downward pull of gravity
+    G_comp1 = g * (m1 * lc1 * math.cos(q_des[0]) + 
+                   m2 * L1  * math.cos(q_des[0]) + 
+                   m2 * lc2 * math.cos(q_des[0] + q_des[1]))
     
-    # Gravity vector G(q_des)
-
-    tauG1comp = -g * (m1 * lc1 * math.cos(q_des[0])
-                    + m2 * L1  * math.cos(q_des[0])
-                    + m2 * lc2 * math.cos(q_des[0] + q_des[1])
-                    )
-
-    tauG2comp = -g * (m2 * lc2 * math.cos(q_des[0] + q_des[1])
-                        ) 
-
-    # Gravity vector G(q)
-    tauG1canc = -g * (m1 * lc1 * math.cos(q[0]) + m2 * L1 * math.cos(q[0]) + m2 * lc2 * math.cos(q[0] + q[1]))
-    tauG2canc = -g * (m2 * lc2 * math.cos(q[0] + q[1]))
-
-
-    tauGcomp = np.array([tauG1comp, tauG2comp])
-    tauGcanc = np.array([tauG1canc, tauG2canc])
-
-        
-    # Operational Space Control 
-    J_dot = np.array([
-        [-L1 * math.cos(q[0]) * qd[0] - L2 * math.cos(q[0] + q[1]) * (qd[0] + qd[1]), -L2 * math.cos(q[0] + q[1]) * (qd[0] + qd[1])],
-        [-L1 * math.sin(q[0]) * qd[0] - L2 * math.sin(q[0] + q[1]) * (qd[0] + qd[1]), -L2 * math.sin(q[0] + q[1]) * (qd[0] + qd[1])]
-    ])
-
-    J_inv = np.linalg.pinv(J_cur)
-    J_inv_T = J_inv.T
-
-    Lambda = J_inv_T @ M @ J_inv
-    Gamma = J_inv_T @ C @ J_inv - Lambda @ J_dot @ J_inv
-    eta = J_inv_T @ tauGcanc
+    G_comp2 = g * (m2 * lc2 * math.cos(q_des[0] + q_des[1]))
+    G_comp = np.array([G_comp1, G_comp2])
     
-    if np.linalg.norm(tip_force) > 1.0:   # in contact
-        Mc = np.diag([1.0, 1.0])    
-        Kc = np.diag([20.0, 20.0])  
-        Dc = np.diag([30.0, 30.0])
-    else:                                   # free motion
-        Mc = np.diag([1.0, 1.0])    
-        Kc = np.diag([2.0, 100.0])    
-        Dc = np.diag([60.0, 40.0])  # High damping is the key — kills the bounce
-            
-    #c_ddot = c_ddot_des + Dc @ c_dot_des + Kc @ Ce
-    J_dot_qd = J_dot @ qd
-    # Impedance controller
-
-    #fc = Lambda @ c_ddot+ Gamma @ c_dot + eta + Mc @ c_ddot_err + Dc @ c_dot_err + Kc @ Ce
-    fc = Lambda @ c_ddot+ Gamma @ c_dot + eta + Jm @ theta_dot + Dm @ theta_ddot
-    tau = J_cur.T @ fc
-
-
-    # Saturation and numerical safety
+    # 4. Calculate desired motor position (theta_des)
+    # We want the spring torque K*(theta_des - q_des) to equal G_comp
+    K_spring = np.array([k1, k2]) 
+    theta_des = q_des + (G_comp / K_spring)
+    
+    # We approximate the desired motor velocity as the desired link velocity
+    thetadot_des = qd_des
+    
+    # ---------------------------------------------------------
+    # STEP B: Motor PD Control
+    # ---------------------------------------------------------
+    
+    # 5. Tuning gains for the motors
+    # (Adjust these if the arm is too jittery or too sluggish)
+    Kp = np.array([15.0, 5.0])   # ~0.5 × k_spring, not 200
+    Kd = np.array([0.5, 0.25]) 
+    
+    # 6. Apply PD control law to drive the motor to theta_des
+    tau = Kp * (theta_des - theta) + Kd * (thetadot_des - theta_dot)
+    
+    # Saturation and numerical safety (Do not modify)
     tau = np.clip(tau, -float(TORQUE_LIMIT), float(TORQUE_LIMIT))
     tau = np.nan_to_num(tau, nan=0.0, posinf=float(TORQUE_LIMIT), neginf=-float(TORQUE_LIMIT))
+    
     return tau, q_des, qd_des
-
 
 # ============================================
 # SIMULATION LOOP WITH COMPLETE CONTROL
@@ -349,9 +275,8 @@ while t < T_final:
             tip_force -= force_on_A
 
 
-    des_force = np.array([1.0, 0.0, 0.0])
-    tau, q_des, qd_des = controller(q, qd, x_des, z_des, xd_des, zd_des, xdd_des, zdd_des, dt_vis,thetadot, thetadotdot,  F_des=des_force, tip_force=tip_force)
     
+    tau, q_des, qd_des = controller(q, qd, theta, thetadot, x_des, z_des, xd_des, zd_des, dt_vis)    
     # -----Please don't modify the wall_force in here ------
     u = np.array([tau[0], tau[1] , wall_force])
     plant.get_actuation_input_port().FixValue(plant_context, u)
