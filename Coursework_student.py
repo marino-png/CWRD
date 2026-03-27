@@ -95,7 +95,7 @@ def trajectory_planner(t: float):
     
     # 4. Velocity (First Derivative)
     xd_des = amp_x * omega * math.cos(omega * t)
-    zd_des = amp_z * omega * math.cos(omega * t + 1.57)
+    zd_des = amp_z * omega * math.cos(omega * t - 1.57)
 
     # 5. Acceleration (Second Derivative)
     xdd_des = -amp_x * (omega**2) * math.sin(omega * t)
@@ -122,71 +122,52 @@ def jacobian(phi1: float, phi2: float, L1: float, L2: float):
     ])
     return J
 
-def controller(q: np.ndarray,
-               qd: np.ndarray,
-               theta: np.ndarray,      # <-- ADDED: Current motor positions
-               theta_dot: np.ndarray,  # <-- Current motor velocities
-               x_des: float,
-               z_des: float,
-               xd_des: float,
-               zd_des: float,
-               dt: float):
-    
-    # ---------------------------------------------------------
-    # STEP A: Calculate required spring deflection 
-    # ---------------------------------------------------------
-    
-    # 1. Use Inverse Kinematics to find desired link position (q_des)
+def controller(q, qd, theta, theta_dot, x_des, z_des, xd_des, zd_des, dt):
+    global q_des_prev
+
+    # 1. Inverse Kinematics
     q_target = inverse_kinematics(x_des, z_des, elbow_up=False)
     if q_target is None:
-        q_target = q.copy() # Fallback if out of reach
-    q_des = q_target
-    
-    # 2. Calculate desired joint velocities (qd_des) using the Jacobian
+        q_target = q_des_prev.copy()
+
+    # Bug 2 fix: clip against previous *desired* q, not actual q
+    max_q_jump = 0.1
+    q_des = np.clip(q_target, q_des_prev - max_q_jump, q_des_prev + max_q_jump)
+    q_des_prev = q_des.copy()  # ← update for next call
+
+    # 2. Desired joint velocities (for logging only — NOT used in damping term)
     J_des = jacobian(q_des[0], q_des[1], L1, L2)
     try:
         qd_des = np.linalg.pinv(J_des) @ np.array([xd_des, zd_des])
     except:
         qd_des = np.zeros(2)
 
-    # 3. Calculate gravity compensation (Torque required to hold links up)
+    # 3. Gravity compensation at desired link position
     m1, m2 = 1.5, 1.5
+    m_rotor2 = 0.4
     g = 9.81
     lc1, lc2 = L1 / 2, L2 / 2
-    
-    # Positive torque required to counteract the downward pull of gravity
-    G_comp1 = g * (m1 * lc1 * math.cos(q_des[0]) + 
-                   m2 * L1  * math.cos(q_des[0]) + 
-                   m2 * lc2 * math.cos(q_des[0] + q_des[1]))
-    
-    G_comp2 = g * (m2 * lc2 * math.cos(q_des[0] + q_des[1]))
-    G_comp = np.array([G_comp1, G_comp2])
-    
-    # 4. Calculate desired motor position (theta_des)
-    # We want the spring torque K*(theta_des - q_des) to equal G_comp
-    K_spring = np.array([k1, k2]) 
-    theta_des = q_des + (G_comp / K_spring)
-    
-    # We approximate the desired motor velocity as the desired link velocity
-    thetadot_des = qd_des
-    
-    # ---------------------------------------------------------
-    # STEP B: Motor PD Control
-    # ---------------------------------------------------------
-    
-    # 5. Tuning gains for the motors
-    # (Adjust these if the arm is too jittery or too sluggish)
-    Kp = np.array([15.0, 5.0])   # ~0.5 × k_spring, not 200
-    Kd = np.array([0.5, 0.25]) 
-    
-    # 6. Apply PD control law to drive the motor to theta_des
-    tau = Kp * (theta_des - theta) + Kd * (thetadot_des - theta_dot)
-    
-    # Saturation and numerical safety (Do not modify)
-    tau = np.clip(tau, -float(TORQUE_LIMIT), float(TORQUE_LIMIT))
-    tau = np.nan_to_num(tau, nan=0.0, posinf=float(TORQUE_LIMIT), neginf=-float(TORQUE_LIMIT))
-    
+
+    tauG1 = (g * math.cos(q_des[0]) * (m1 * lc1 + m_rotor2 * L1 + m2 * L1)
+             + m2 * g * lc2 * math.cos(q_des[0] + q_des[1]))
+    tauG2 = m2 * g * lc2 * math.cos(q_des[0] + q_des[1])
+    tauG = np.array([tauG1, tauG2])
+
+    # 4. Desired motor angles (gravity pre-stretch): θ_d = q_d + K⁻¹ τ_g(q_d)
+    k = np.diag([k1, k2])
+    theta_des = q_des + np.linalg.solve(k, tauG)
+
+    # 5. PD + G-Comp: τ_m = K_P(θ_d − θ) − K_D θ̇ + τ_g(q_d)
+    k_p = np.diag([25.0, 15.0])
+    k_d = np.diag([0.5, 0.3])
+
+    # Bug 1 fix: damping is -K_D θ̇, NOT K_D(q̇_des − θ̇)
+    tau = k_p @ (theta - theta_des) - k_d @ theta_dot  + tauG
+
+    print("Controller Debug | q_des: {}, theta_des: {}, tau: {}".format(
+        q_des, theta_des, tau))
     return tau, q_des, qd_des
+
 
 # ============================================
 # SIMULATION LOOP WITH COMPLETE CONTROL
@@ -248,7 +229,7 @@ while t < T_final:
 
     # ---------------------------------------
     # 1. Acquire Feedback
-    thetadotdot = (thetadot - thetadot_prev) / dt_vis
+    thetaddot = (thetadot - thetadot_prev) / dt_vis
     thetadot_prev = thetadot.copy()
 
     q = theta + spring_delta
@@ -276,7 +257,8 @@ while t < T_final:
 
 
     
-    tau, q_des, qd_des = controller(q, qd, theta, thetadot, x_des, z_des, xd_des, zd_des, dt_vis)    
+    tau, q_des, qd_des = controller(q, qd, theta, thetadot ,x_des, z_des, xd_des, zd_des, dt_vis)    
+
     # -----Please don't modify the wall_force in here ------
     u = np.array([tau[0], tau[1] , wall_force])
     plant.get_actuation_input_port().FixValue(plant_context, u)
