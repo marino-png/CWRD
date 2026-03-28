@@ -80,13 +80,13 @@ def inverse_kinematics(x_target, z_target, elbow_up=False):
 def trajectory_planner(t: float):
     
     x0 = 1.12  #
-    z0 = -0.5   
+    z0 = -1.0   
     
     # 2. Parameters for the Motion
     freq = 0.1 # 10 seconds per full cycle
     omega = 2.0 * math.pi * freq
-    amp_x = 0.3 # Oscillates between x=1.02 and x=1.22
-    amp_z = 0.3 # Oscillates between z=-0.5 and z=0.5
+    amp_x = 0.4 # Oscillates between x=1.02 and x=1.22
+    amp_z = 0.4 # Oscillates between z=-0.5 and z=0.5
     
     # 3. Position: Circular/Elliptical path
     # Using 1.57 (pi/2) phase shift for z makes it a circle
@@ -153,19 +153,24 @@ def controller(q, qd, theta, theta_dot, x_des, z_des, xd_des, zd_des, dt):
     tauG2 = m2 * g * lc2 * math.cos(q_des[0] + q_des[1])
     tauG = np.array([tauG1, tauG2])
 
-    # 4. Desired motor angles (gravity pre-stretch): θ_d = q_d + K⁻¹ τ_g(q_d)
-    k = np.diag([k1, k2])
-    theta_des = q_des + np.linalg.solve(k, tauG)
+    k_mat = np.diag([k1, k2])
+    theta_des = q_des + np.linalg.solve(k_mat, tauG)
 
-    # 5. PD + G-Comp: τ_m = K_P(θ_d − θ) − K_D θ̇ + τ_g(q_d)
-    k_p = np.diag([25.0, 15.0])
-    k_d = np.diag([0.5, 0.3])
 
-    # Bug 1 fix: damping is -K_D θ̇, NOT K_D(q̇_des − θ̇)
-    tau = k_p @ (theta - theta_des) - k_d @ theta_dot  + tauG
+    # 6. PD with spring-mode damping
+    # K_P must satisfy K_P < 4*J/dt^2:
+    #   joint1: 4*0.00128/0.02^2 = 12.8  → use 6
+    #   joint2: 4*0.00102/0.02^2 = 10.2  → use 2  (soft spring = lower limit)
+    k_p = np.diag([15.0, 8.0])
+    k_d = np.diag([0.08, 0.05])
 
-    print("Controller Debug | q_des: {}, theta_des: {}, tau: {}".format(
-        q_des, theta_des, tau))
+    thetadot_des = qd_des
+
+    
+    tau = k_p @ (theta_des - theta) - k_d @ (thetadot_des - thetadot) + tauG
+
+    print("Controller Debug: q_des = {}, theta_des = {}, tau = {}".format(q_des, theta_des, tau))
+
     return tau, q_des, qd_des
 
 
