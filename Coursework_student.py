@@ -76,50 +76,30 @@ def inverse_kinematics(x_target, z_target, elbow_up=False):
     q1 = alpha - beta
 
     return np.array([q1, q2])
- 
+
 def trajectory_planner(t: float):
-    # Wall is at x=1.1, so 1.12 gives a gentle, stable contact force
-    x_wall_contact = 1.12  
-    z_start = -1.0
-    
-    # Parameters for the Drawing Motion
-    freq = 0.1 # 10 seconds per full up-and-down cycle
+
+    x0 = 1.12  #
+    z0 = -1.5   
+
+    # 2. Parameters for the Motion
+    freq = 0.1 # 10 seconds per full cycle
     omega = 2.0 * math.pi * freq
-    amp_z = 0.5 
-    z0 = -0.5 # Z will oscillate between -1.0 and 0.0
-    
-    # Initial EE position (from forward kinematics at t=0)
-    q_init = np.array([phi1_init, phi2_init])
-    ee_init = forward_kinematics(q_init[0], q_init[1])
-    
-    t_transition = 2.0   # seconds to move from start to the wall
-    
-    if t < t_transition:
-        # Smooth transition using cubic interpolation (3s^2 - 2s^3)
-        s = t / t_transition
-        s_smooth = 3 * (s**2) - 2 * (s**3)
-        ds_dt = (6 * s - 6 * s**2) / t_transition
-        
-        x_des = ee_init[0] + s_smooth * (x_wall_contact - ee_init[0])
-        z_des = ee_init[1] + s_smooth * (z_start - ee_init[1])
-        
-        xd_des = ds_dt * (x_wall_contact - ee_init[0])
-        zd_des = ds_dt * (z_start - ee_init[1])
-        xdd_des = 0.0
-        zdd_des = 0.0
-    else:
-        # Draw a vertical line on the wall
-        t_line = t - t_transition
-        x_des = x_wall_contact
-        
-        # Sine wave oscillating around z0
-        z_des = z0 + amp_z * math.sin(omega * t_line - math.pi/2)
-        
-        xd_des = 0.0
-        zd_des = amp_z * omega * math.cos(omega * t_line - math.pi/2)
-        
-        xdd_des = 0.0
-        zdd_des = -amp_z * (omega**2) * math.sin(omega * t_line - math.pi/2)
+    amp_x = 0.5 # Oscillates between x=1.02 and x=1.22
+    amp_z = 0.5 # Oscillates between z=-0.5 and z=0.5
+
+    # 3. Position: Circular/Elliptical path
+    # Using 1.57 (pi/2) phase shift for z makes it a circle
+    x_des = x0 + amp_x * math.sin(omega * t)
+    z_des = z0 + amp_z * math.sin(omega * t - 1.57)
+
+    # 4. Velocity (First Derivative)
+    xd_des = amp_x * omega * math.cos(omega * t)
+    zd_des = amp_z * omega * math.cos(omega * t - 1.57)
+
+    # 5. Acceleration (Second Derivative)
+    xdd_des = -amp_x * (omega**2) * math.sin(omega * t)
+    zdd_des = -amp_z * (omega**2) * math.sin(omega * t - 1.57)
 
     return x_des, z_des, xd_des, zd_des, xdd_des, zdd_des
 
@@ -182,13 +162,13 @@ def controller(q, qd, theta, theta_dot, x_des, z_des, xd_des, zd_des, dt):
     # K_P must satisfy K_P < 4*J/dt^2:
     #   joint1: 4*0.00128/0.02^2 = 12.8  → use 6
     #   joint2: 4*0.00102/0.02^2 = 10.2  → use 2  (soft spring = lower limit)
-    k_p = np.diag([45.8, 30])
-    k_d = np.diag([0.3, 0.3])
+    k_p = np.diag([40, 25])
+    k_d = np.diag([0.2, 0.2])
 
     
     k_d = k_d @ theta_dot 
-    k_p = k_p @ (theta_des - theta)
-    tau = tauG + k_p  - k_d 
+    k_p = k_p @ (theta - theta_des)
+    tau = tauG - k_p  - k_d 
     tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
 
     print( "kp = {}, kd = {}".format(k_p, k_d), "tauG =",tauG, "tau =", tau)
