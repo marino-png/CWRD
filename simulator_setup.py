@@ -33,7 +33,7 @@ def setup_simulator():
     z0 = 0.0
     axis = [0, 1, 0]
     dt = 0.001
-    k1, k2 = 60.5, 60.01
+    k1, k2 = 30.5, 10.01
     wall_x = 1.1
     wall_thickness = 0.03
     wall_width_y = 0.70
