@@ -42,7 +42,7 @@ q_err_integral = np.zeros(2)
 q_des_prev = np.array([phi1_init, phi2_init])
 
 def forward_kinematics(J1, J2):
-    
+
     x = L1 * math.cos(J1) + L2 * math.cos(J1 + J2)
     z = L1 * math.sin(J1) + L2 * math.sin(J1 + J2)
     #print("Current EE position: x={:.4f} m, z={:.4f} m".format(x, z))
@@ -60,10 +60,10 @@ def inverse_kinematics(x_target, z_target, elbow_up=False):
     # Calculate q2
     # Law of Cosines: cos(q2) = (x^2 + z^2 - L1^2 - L2^2) / (2 * L1 * L2)
     cos_q2 = (dist_sq - L1**2 - L2**2) / (2 * L1 * L2)
-    
+
     # Account for floating point errors (stay within [-1, 1])
     cos_q2 = max(-1.0, min(1.0, cos_q2))
-    
+
     if elbow_up:
         q2 = -math.acos(cos_q2)
     else:
@@ -76,30 +76,50 @@ def inverse_kinematics(x_target, z_target, elbow_up=False):
     q1 = alpha - beta
 
     return np.array([q1, q2])
-
+ 
 def trajectory_planner(t: float):
-
-    x0 = 1.12  #
-    z0 = -1.5   
-
-    # 2. Parameters for the Motion
-    freq = 0.1 # 10 seconds per full cycle
+    # Wall is at x=1.1, so 1.12 gives a gentle, stable contact force
+    x_wall_contact = 1.12  
+    z_start = -1.0
+    
+    # Parameters for the Drawing Motion
+    freq = 0.1 # 10 seconds per full up-and-down cycle
     omega = 2.0 * math.pi * freq
-    amp_x = 0.5 # Oscillates between x=1.02 and x=1.22
-    amp_z = 0.5 # Oscillates between z=-0.5 and z=0.5
-
-    # 3. Position: Circular/Elliptical path
-    # Using 1.57 (pi/2) phase shift for z makes it a circle
-    x_des = x0 + amp_x * math.sin(omega * t)
-    z_des = z0 + amp_z * math.sin(omega * t - 1.57)
-
-    # 4. Velocity (First Derivative)
-    xd_des = amp_x * omega * math.cos(omega * t)
-    zd_des = amp_z * omega * math.cos(omega * t - 1.57)
-
-    # 5. Acceleration (Second Derivative)
-    xdd_des = -amp_x * (omega**2) * math.sin(omega * t)
-    zdd_des = -amp_z * (omega**2) * math.sin(omega * t - 1.57)
+    amp_z = 0.5 
+    z0 = -0.5 # Z will oscillate between -1.0 and 0.0
+    
+    # Initial EE position (from forward kinematics at t=0)
+    q_init = np.array([phi1_init, phi2_init])
+    ee_init = forward_kinematics(q_init[0], q_init[1])
+    
+    t_transition = 2.0   # seconds to move from start to the wall
+    
+    if t < t_transition:
+        # Smooth transition using cubic interpolation (3s^2 - 2s^3)
+        s = t / t_transition
+        s_smooth = 3 * (s**2) - 2 * (s**3)
+        ds_dt = (6 * s - 6 * s**2) / t_transition
+        
+        x_des = ee_init[0] + s_smooth * (x_wall_contact - ee_init[0])
+        z_des = ee_init[1] + s_smooth * (z_start - ee_init[1])
+        
+        xd_des = ds_dt * (x_wall_contact - ee_init[0])
+        zd_des = ds_dt * (z_start - ee_init[1])
+        xdd_des = 0.0
+        zdd_des = 0.0
+    else:
+        # Draw a vertical line on the wall
+        t_line = t - t_transition
+        x_des = x_wall_contact
+        
+        # Sine wave oscillating around z0
+        z_des = z0 + amp_z * math.sin(omega * t_line - math.pi/2)
+        
+        xd_des = 0.0
+        zd_des = amp_z * omega * math.cos(omega * t_line - math.pi/2)
+        
+        xdd_des = 0.0
+        zdd_des = -amp_z * (omega**2) * math.sin(omega * t_line - math.pi/2)
 
     return x_des, z_des, xd_des, zd_des, xdd_des, zdd_des
 
@@ -137,6 +157,7 @@ def controller(q, qd, theta, theta_dot, x_des, z_des, xd_des, zd_des, dt):
 
     # 2. Desired joint velocities (for logging only — NOT used in damping term)
     J_des = jacobian(q_des[0], q_des[1], L1, L2)
+    J = jacobian(theta[0], theta[1], L1, L2)
     try:
         qd_des =  np.array([xd_des, zd_des])
     except:
@@ -162,17 +183,17 @@ def controller(q, qd, theta, theta_dot, x_des, z_des, xd_des, zd_des, dt):
     # K_P must satisfy K_P < 4*J/dt^2:
     #   joint1: 4*0.00128/0.02^2 = 12.8  → use 6
     #   joint2: 4*0.00102/0.02^2 = 10.2  → use 2  (soft spring = lower limit)
-    k_p = np.diag([40, 25])
-    k_d = np.diag([0.2, 0.2])
+    k_p = np.diag([1.2, 2.8])
+    k_d = np.diag([0.48, 0.39])
 
-    
+
     k_d = k_d @ theta_dot 
-    k_p = k_p @ (theta - theta_des)
-    tau = tauG - k_p  - k_d 
+    k_p = k_p @ (theta_des - theta)
+    tau = tauG + k_p  - k_d 
     tau = np.clip(tau, -TORQUE_LIMIT, TORQUE_LIMIT)
 
-    print( "kp = {}, kd = {}".format(k_p, k_d), "tauG =",tauG, "tau =", tau)
-    #print("Controller Debug: q_des = {}, theta_des = {}, tau = {}".format(q_des, theta_des, tau))
+    #print( "kp = {}, kd = {}".format(k_p, k_d), "tauG =",tauG, "tau =", tau)
+    print("Controller Debug: theta = {}, theta_des = {}, tau = {}".format(theta, theta_des, tau))
 
     return tau, q_des, qd_des
 
@@ -217,7 +238,7 @@ while t < T_final:
     theta = np.array([jl1.get_angle(plant_context), jl2.get_angle(plant_context)])
     thetadot = np.array([jl1.get_angular_rate(plant_context), jl2.get_angular_rate(plant_context)])
 
-    
+
     spring_delta = np.array([jdel1.get_angle(plant_context), jdel2.get_angle(plant_context)])
     spring_deltad = np.array([jdel1.get_angular_rate(plant_context), jdel2.get_angular_rate(plant_context)])
     wall_pos = j_wall.get_translation(plant_context)
@@ -233,7 +254,7 @@ while t < T_final:
         wall_fric = -fric_coulomb * np.sign(wall_vel)
 
     wall_force = wall_drive + wall_fric
-    
+
 
     # ---------------------------------------
     # 1. Acquire Feedback
@@ -264,7 +285,7 @@ while t < T_final:
         info = contact_results.point_pair_contact_info(i)
         body_A = plant.get_body(info.bodyA_index()).name()
         body_B = plant.get_body(info.bodyB_index()).name()
-        
+
         force_on_A = info.contact_force()
         # Only count if the contact is specifically between link2 and wall
         if (body_A == "link2" and body_B == "wall"):
@@ -273,7 +294,7 @@ while t < T_final:
             tip_force -= force_on_A
 
 
-    
+
     tau, q_des, qd_des = controller(q, qd, theta, thetadot ,x_des, z_des, xd_des, zd_des, dt_vis)    
 
     # -----Please don't modify the wall_force in here ------
@@ -288,10 +309,10 @@ while t < T_final:
     q_wall_pos = j_wall.get_translation(plant_context)
     wall_surface_x_nominal = (wall_x + q_wall_pos) - wall_thickness / 2.0
     dist_to_wall = wall_surface_x_nominal - ee_current[0]
-    
+
     if dist_to_wall <= 0.016: 
          contact_log.append(ee_current.copy())
-    
+
     # Extract desired task-space position from the trajectory data
     x_des, z_des, xd_des, zd_des, xdd_des, zdd_des = traj_data
     p_des = np.array([x_des, z_des])
@@ -302,20 +323,20 @@ while t < T_final:
         qd_des_joint = J_inv @ np.array([xd_des, zd_des])
     except:
         qd_des_joint = np.zeros(2)
-    
+
     # Set dummy variables for the values we aren't actively computing
     qdd_des = np.zeros(2)          # Desired joint acceleration
     delta_des = np.zeros(2)        # Desired spring deflection (ideally 0)
     theta_des = q_des.copy()       # Desired motor angle
     thetadot_des = qd_des_joint.copy() 
-    
+
     # Calculate the actual torque experienced by the links due to the springs
     tau_link = np.array([k1 * spring_delta[0], k2 * spring_delta[1]])
-    
+
     # Reassign qd_des so the logger picks up the correct joint velocities
     qd_des = qd_des_joint
 
-    
+
     # ----Cancel the comment when you need to plot your data. -----
 
     time_log.append(t)
@@ -360,4 +381,3 @@ plot_results(time_log, q_log, q_des_log, qd_log, qd_des_log, qdd_log, qdd_des_lo
 print("\n" + "="*60)
 print("MeshCat visualization is running...")
 print("="*60)
-input("\nPress Enter to quit...")
